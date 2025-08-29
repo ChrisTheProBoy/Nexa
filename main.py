@@ -272,7 +272,7 @@ def main():
 
             if (user_input.lower().startswith(("remember", "remeber")) or
                 re.match(r"remind me that .+ is .+", user_input, re.IGNORECASE)):
-                if user_input.lower().startswith(("remember", "remeber")):
+                if user_input.lower().startswith(("remember", "remeber",)):
                     _, fact = (user_input.lower().split("remeber", 1) if user_input.lower().startswith("remeber")
                                else user_input.split("remember", 1))
                     key, value = fact.strip().split("is", 1)
@@ -287,8 +287,8 @@ def main():
                 memory.save_interaction("nexa", response, relationship=relationship)
                 continue
 
-            if user_input.lower().startswith(("what is my", "do you remember")):
-                key = user_input.replace("what is my", "").replace("do you remember", "").strip()
+            if user_input.lower().startswith(("what is my", "do you remember", "schedule")):
+                key = user_input.replace("what is my", "").replace("do you remember", "").replace("schedule", "").strip()
                 value = memory.recall_fact(key)
                 if value:
                     response = f"Your {key} is recorded as {value}, {memory.get_user_name().capitalize() if memory.get_user_name() else 'Sir'}."
@@ -333,7 +333,7 @@ def main():
 
 
             if user_input.lower() in {"what are my reminders", "show reminders", "show my reminders",
-                                     "what all are my reminders"}:
+                                     "what all are my reminders", "so what all are im upto today", "whats there in my schedule", "whats my schedule", "whats the schedule for today","what im upto today"}:
                 try:
                     reminders = memory.get_reminders()
                     if reminders:

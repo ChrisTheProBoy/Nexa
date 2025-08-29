@@ -1,71 +1,47 @@
 import os
 import json
-import logging
 from datetime import datetime
-from sentence_transformers import SentenceTransformer, util
-
-logging.basicConfig(level=logging.DEBUG, format="[%(levelname)s] %(message)s")
+from pathlib import Path
 
 
 class MemoryManager:
-    """
-    Advanced memory system with embeddings, facts, traits, reminders, and interactions.
-    Also logs all interactions into a dataset JSONL file for fine-tuning later.
-    """
-
     def __init__(self, user_id: str, memory_dir: str = "memory"):
-        self.user_id = user_id.lower().replace(" ", "_")
-        self.memory_dir = memory_dir
-        os.makedirs(self.memory_dir, exist_ok=True)
+        self.user_id = user_id
+        self.memory_dir = Path(memory_dir)
+        self.memory_dir.mkdir(parents=True, exist_ok=True)
 
-        self.memory_path = os.path.join(self.memory_dir, f"{self.user_id}.json")
-        self.dataset_path = os.path.join(self.memory_dir, f"{self.user_id}_dataset.jsonl")
+        self.memory_path = self.memory_dir / f"{user_id}.json"
+        self.dataset_path = self.memory_dir / f"{user_id}_dataset.jsonl"
 
-        self.model = SentenceTransformer("all-MiniLM-L6-v2")
-
-        # Default structure
         self.data = {
             "facts": {},
             "traits": {},
+            "preferences": {},
             "reminders": [],
             "interactions": [],
-            "relationships": {}
         }
         self.load_memory()
 
-    # ---------------- Persistence ----------------
+    # ----------------- Memory Persistence -----------------
     def load_memory(self):
-        if os.path.exists(self.memory_path):
+        if self.memory_path.exists():
             try:
                 with open(self.memory_path, "r", encoding="utf-8") as f:
                     self.data = json.load(f)
-                logging.info(f"[MemoryManager] Loaded memory for {self.user_id}")
             except Exception as e:
-                logging.error(f"[MemoryManager] Failed to load memory: {e}")
+                print(f"[MemoryManager] Failed to load memory: {e}")
 
     def save_memory(self):
         try:
             with open(self.memory_path, "w", encoding="utf-8") as f:
-                json.dump(self.data, f, indent=2, ensure_ascii=False)
+                json.dump(self.data, f, indent=2)
         except Exception as e:
-            logging.error(f"[MemoryManager] Failed to save memory: {e}")
+            print(f"[MemoryManager] Failed to save memory: {e}")
 
-    # ---------------- Dataset logging ----------------
-    def log_dataset_entry(self, role: str, content: str):
-        """Append an interaction to dataset JSONL file."""
-        entry = {"role": role, "content": content}
-        try:
-            with open(self.dataset_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-        except Exception as e:
-            logging.error(f"[Dataset Log Error] {e}")
-
-    # ---------------- Interaction handling ----------------
+    # ----------------- Interaction Logging -----------------
     def save_interaction(self, role: str, content: str, **kwargs):
         timestamp = datetime.now().isoformat()
         interaction = {"role": role, "content": content, "time": timestamp}
-
-        # Add any extra metadata (relationship, tags, mood, etc.)
         if kwargs:
             interaction.update(kwargs)
 
@@ -75,68 +51,76 @@ class MemoryManager:
         # Log to dataset
         self.log_dataset_entry(role, content)
 
-
-    def search_interactions(self, query: str, top_k: int = 5):
-        if not self.data["interactions"]:
-            return []
+    def log_dataset_entry(self, role: str, content: str):
         try:
-            embeddings = [self.model.encode(i["content"], convert_to_tensor=True)
-                          for i in self.data["interactions"]]
-            query_emb = self.model.encode(query, convert_to_tensor=True)
-            scores = [util.cos_sim(query_emb, emb).item() for emb in embeddings]
-            ranked = sorted(zip(scores, self.data["interactions"]), key=lambda x: x[0], reverse=True)
-            return [i["content"] for _, i in ranked[:top_k]]
+            with open(self.dataset_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps({"role": role, "content": content}) + "\n")
         except Exception as e:
-            logging.error(f"[Search Error] {e}")
-            return []
+            print(f"[MemoryManager] Failed to log dataset entry: {e}")
 
-    # ---------------- Facts, Traits, Reminders ----------------
+    # ----------------- Knowledge Storage -----------------
     def remember_fact(self, key: str, value: str):
         self.data["facts"][key] = value
         self.save_memory()
 
-    def recall_fact(self, key: str):
-        return self.data["facts"].get(key)
+    def set_user_name(self, name: str):
+        """
+        Legacy support: sets the preferred name to address the user as.
+        Equivalent to updating the 'address_me_as' preference.
+        """
+        self.update_preference("address_me_as", name)
 
-    def get_facts(self) -> dict:
-        return dict(self.data.get("facts", {}))
+    def get_user_name(self) -> str:
+        """
+        Legacy support: returns the preferred name to address the user as.
+        Looks up 'address_me_as' in preferences, or defaults to 'User'.
+        """
+        return self.get_preferences().get("address_me_as", "User")
 
     def update_trait(self, key: str, value: str):
         self.data["traits"][key] = value
         self.save_memory()
 
+    def update_preference(self, key: str, value: str):
+        """
+        Update or add a user preference (e.g., programming_language=C, tone=brief).
+        """
+        self.data.setdefault("preferences", {})
+        self.data["preferences"][key] = value
+        self.save_memory()
+
+    def add_reminder(self, reminder: str, time: str):
+        self.data["reminders"].append({"message": reminder, "time": time})
+        self.save_memory()
+
+    # ----------------- Retrieval -----------------
+    def get_facts(self) -> dict:
+        return self.data.get("facts", {})
+
     def get_traits(self) -> dict:
-        return dict(self.data.get("traits", {}))
+        return self.data.get("traits", {})
 
-    def add_reminder(self, message: str, time: str):
-        self.data["reminders"].append({"message": message, "time": time})
-        self.save_memory()
-
-    def get_reminders(self):
-        return list(self.data.get("reminders", []))
-
-    # ---------------- Preferences & Relationships ----------------
     def get_preferences(self) -> dict:
-        return dict(self.data.get("preferences", {})) if "preferences" in self.data else {}
+        return self.data.get("preferences", {})
 
-    def set_relationship(self, person: str, relation: str):
-        self.data["relationships"][person] = relation
-        self.save_memory()
+    def get_reminders(self) -> list:
+        return self.data.get("reminders", [])
 
-    def get_relationships(self):
-        return dict(self.data.get("relationships", {}))
+    def search_interactions(self, query: str, top_k: int = 5):
+        """
+        Simple keyword search in interactions.
+        """
+        matches = []
+        for i in reversed(self.data.get("interactions", [])):
+            if query.lower() in i["content"].lower():
+                matches.append(i["content"])
+            if len(matches) >= top_k:
+                break
+        return matches
 
-    # ---------------- User name ----------------
-    def set_user_name(self, name: str):
-        self.data["user_name"] = name
-        self.save_memory()
-
-    def get_user_name(self):
-        return self.data.get("user_name", self.user_id)
     def retrieve_context(self, query: str = "", top_k: int = 5) -> str:
         """
-        Retrieve a combined context string from memory: facts, traits, reminders, and recent interactions.
-        Optionally perform a semantic search on past interactions with a query.
+        Retrieve a combined context string from memory: facts, traits, reminders, preferences, and recent interactions.
         """
         parts = []
 
@@ -163,5 +147,5 @@ class MemoryManager:
 
         if interactions:
             parts.append("Recent interactions: " + "; ".join(interactions))
-        return "\n".join(parts) if parts else "No context available."
 
+        return "\n".join(parts) if parts else "No context available."
