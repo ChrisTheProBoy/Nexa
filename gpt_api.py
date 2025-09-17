@@ -1,167 +1,141 @@
-import os
 import logging
 import openai
-import re
-from memory_manager import MemoryManager
-from local_llm import generate_local_response
-
-# Configure logging
-logging.basicConfig(level=logging.DEBUG, format="[%(levelname)s] %(message)s")
-
-if "OPENAI_API_KEY" not in os.environ:
-    logging.warning("OPENAI_API_KEY not found. GPT calls will fail unless set.")
-
-
-def detect_and_store_preferences(memory: MemoryManager, user_input: str):
-    """
-    Detect preferences in user input and store them in memory.
-    Includes specific rules + a generic fallback for 'Call me X' or 'Don't do Y'.
-    """
-    lowered = user_input.lower()
-
-    # --- Specific Rules ---
-
-    # Programming language preferences
-    if "in python" in lowered:
-        memory.update_preference("programming_language", "Python")
-    elif "in c" in lowered:
-        memory.update_preference("programming_language", "C")
-    elif "in java" in lowered:
-        memory.update_preference("programming_language", "Java")
-
-    # Tone preferences
-    if "be brief" in lowered or "short answer" in lowered:
-        memory.update_preference("tone", "brief")
-    elif "explain in detail" in lowered or "be detailed" in lowered:
-        memory.update_preference("tone", "detailed")
-    elif "be professional" in lowered:
-        memory.update_preference("tone", "professional")
-    elif "be friendly" in lowered:
-        memory.update_preference("tone", "friendly")
-
-    # Units preferences
-    if "use metric" in lowered:
-        memory.update_preference("units", "metric")
-    elif "use imperial" in lowered:
-        memory.update_preference("units", "imperial")
-
-    # Emojis preferences
-    if "with emojis" in lowered:
-        memory.update_preference("emojis", "yes")
-    elif "no emojis" in lowered or "without emojis" in lowered:
-        memory.update_preference("emojis", "no")
-
-    # --- Generic Rules ---
-
-    # "Call me <X>" → address_me_as
-    match_name = re.search(r"call me ([a-zA-Z0-9_ ]+)", lowered)
-    if match_name:
-        nickname = match_name.group(1).strip().title()
-        memory.update_preference("address_me_as", nickname)
-
-    # "Don't <do X>" → store as negative preference
-    match_dont = re.search(r"don['’]t (.+)", lowered)
-    if match_dont:
-        action = match_dont.group(1).strip()
-        memory.update_preference(f"avoid_{action.replace(' ', '_')}", True)
-
-    # "Always <do X>" → store as positive preference
-    match_always = re.search(r"always (.+)", lowered)
-    if match_always:
-        action = match_always.group(1).strip()
-        memory.update_preference(f"always_{action.replace(' ', '_')}", True)
-
-    # "I prefer <X>" → generic preference
-    match_prefer = re.search(r"i prefer ([a-zA-Z0-9_ ]+)", lowered)
-    if match_prefer:
-        preference = match_prefer.group(1).strip()
-        memory.update_preference("general_preference", preference)
-
-
+import requests
+import subprocess
+import json
 
 class NexaHybridAPI:
-    def __init__(self, user_id: str, memory: MemoryManager, local_model: str = "mistral:latest"):
+    """
+    Hybrid API for Nexa:
+      1. Try Ollama via REST API (fastest).
+      2. If that fails, try Ollama CLI via subprocess.
+      3. If both fail, fall back to OpenAI.
+    Preferences from MemoryManager are always injected.
+    Clarification rule: if input is vague, Nexa must ask clarifying questions.
+    """
+
+    def __init__(self, user_id, memory, local_model="mistral:latest", remote_model="gpt-4o-mini"):
         self.user_id = user_id
         self.memory = memory
         self.local_model = local_model
+        self.remote_model = remote_model
 
-    def generate_openai_response(self, prompt: str, system_prompt: str = "") -> str:
-        try:
-            # Detect and save preferences
-            detect_and_store_preferences(self.memory, prompt)
+    # ----------------- Preferences -----------------
+    def _apply_preferences(self, base_prompt: str, user_input: str) -> str:
+        prefs = self.memory.get_preferences()
+        preference_lines = []
 
-            context = self.memory.retrieve_context(query=prompt)
-            messages = []
-            if system_prompt:
-                messages.append({"role": "system", "content": system_prompt})
-            if context:
-                messages.append({"role": "system", "content": f"Context: {context}"})
-
-            # Inject preferences
-            prefs = self.memory.get_preferences()
-            if prefs:
-                messages.append({"role": "system", "content": f"User preferences: {prefs}"})
-
-            messages.append({"role": "user", "content": prompt})
-            logging.debug(f"[OpenAI Request] Messages: {messages}")
-
-            response = openai.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=messages,
+        if "programming_language" in prefs:
+            preference_lines.append(
+                f"⚠️ The user’s primary programming language is {prefs['programming_language']}. "
+                f"Never default to another language unless explicitly requested."
             )
-            answer = response.choices[0].message["content"]
 
-            self.memory.save_interaction("user", prompt)
-            self.memory.save_interaction("nexa", answer)
-            return answer
-        except Exception as e:
-            error_msg = f"[OpenAI API Error] {str(e)}"
-            logging.error(error_msg)
-            self.memory.save_interaction("nexa", error_msg)
-            return error_msg
+        if "tone" in prefs:
+            preference_lines.append(f"Adopt a {prefs['tone']} tone.")
+        if "units" in prefs:
+            preference_lines.append(f"Use {prefs['units']} units when applicable.")
+        if "emojis" in prefs:
+            preference_lines.append("Include emojis." if prefs["emojis"] == "yes" else "Do not include emojis.")
+        if "address_me_as" in prefs:
+            preference_lines.append(f"Always address the user as {prefs['address_me_as']}.")
 
-    def generate_mistral_response(self, prompt: str, system_prompt: str = "") -> str:
+        for key, value in prefs.items():
+            if key.startswith("always_") and value is True:
+                preference_lines.append(f"Always {key.replace('always_', '').replace('_', ' ')}.")
+            elif key.startswith("avoid_") and value is True:
+                preference_lines.append(f"Avoid {key.replace('avoid_', '').replace('_', ' ')}.")
+            elif key == "general_preference":
+                preference_lines.append(f"Note user prefers: {value}.")
+
+        clarification_rule = (
+            "⚠️ IMPORTANT: If the user's input is vague, ambiguous, or unclear "
+            f"(example: '{user_input}'), DO NOT guess. Instead, politely ask a clarifying question first."
+        )
+        preference_lines.append(clarification_rule)
+
+        if preference_lines:
+            base_prompt += "\nUser preferences & rules:\n" + "\n".join(preference_lines)
+
+        return base_prompt
+
+    # ----------------- Local Ollama (REST) -----------------
+    def _call_ollama_rest(self, prompt: str) -> str | None:
         try:
-            # Detect and save preferences
-            detect_and_store_preferences(self.memory, prompt)
-
-            context = self.memory.retrieve_context(query=prompt)
-            if context:
-                full_prompt = f"{system_prompt}\nContext: {context}\nUser: {prompt}"
-            else:
-                full_prompt = f"{system_prompt}\nUser: {prompt}"
-
-            # Inject preferences
-            prefs = self.memory.get_preferences()
-            if prefs:
-                full_prompt += f"\nUser preferences: {prefs}"
-
-            logging.debug(f"[Mistral Request] {full_prompt}")
-            answer = generate_local_response(full_prompt)
-
-            self.memory.save_interaction("user", prompt)
-            self.memory.save_interaction("nexa", answer)
-            return answer
+            url = "http://localhost:11434/api/generate"
+            payload = {"model": self.local_model, "prompt": prompt, "stream": False}
+            resp = requests.post(url, json=payload, timeout=120)
+            resp.raise_for_status()
+            data = resp.json()
+            return f"(local-{self.local_model}) {data.get('response', '').strip()}"
         except Exception as e:
-            error_msg = f"[Mistral Error] {str(e)}"
-            logging.error(error_msg)
-            self.memory.save_interaction("nexa", error_msg)
-            return error_msg
+            logging.warning(f"[Ollama REST] failed: {e}")
+            return None
 
-    def generate_response(self, prompt: str, system_prompt: str, prefer_local: bool = False) -> str:
-        if prefer_local and self.local_model:
-            response = self.generate_mistral_response(prompt, system_prompt)
-            if len(response) > 10 and not response.startswith("[Mistral Error]"):
-                return response
-            logging.debug("Mistral response inadequate; falling back to OpenAI.")
-        return self.generate_openai_response(prompt, system_prompt)
+    # ----------------- Local Ollama (CLI) -----------------
+    def _call_ollama_cli(self, prompt: str) -> str | None:
+        try:
+            result = subprocess.run(
+                ["ollama", "run", self.local_model],
+                input=prompt.encode("utf-8"),
+                capture_output=True,
+                timeout=120
+            )
+            if result.returncode == 0:
+                return f"(local-{self.local_model}) {result.stdout.decode('utf-8').strip()}"
+            else:
+                logging.error(f"[Ollama CLI] error: {result.stderr.decode('utf-8')}")
+                return None
+        except Exception as e:
+            logging.error(f"[Ollama CLI] call failed: {e}")
+            return None
 
+    # ----------------- OpenAI -----------------
+    def _call_openai(self, prompt: str, force_json: bool = False) -> str:
+        try:
+            if force_json:
+                resp = openai.chat.completions.create(
+                    model=self.remote_model,
+                    messages=[
+                        {"role": "system", "content": "You are a JSON-only output generator. Always reply with a valid JSON object, no prose."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0,
+                    max_tokens=500,
+                    response_format={"type": "json_object"}  # ✅ ensures raw JSON output
+                )
+                return resp.choices[0].message["content"].strip()
+            else:
+                resp = openai.chat.completions.create(
+                    model=self.remote_model,
+                    messages=[{"role": "system", "content": prompt}],
+                    temperature=0.7,
+                    max_tokens=600,
+                )
+                return f"(remote-{self.remote_model}) {resp.choices[0].message['content'].strip()}"
+        except Exception as e:
+            logging.error(f"[OpenAI] request failed: {e}")
+            return f"My apologies, Sir, the OpenAI fallback also failed: {e}"
 
-def generate_gpt_response(user_input: str, system_prompt: str = "") -> str:
-    try:
-        memory = MemoryManager(user_id="default-router")
-        api = NexaHybridAPI(user_id="default-router", memory=memory, local_model="mistral:latest")
-        return api.generate_openai_response(user_input, system_prompt)
-    except Exception as e:
-        logging.error(f"[Router GPT Wrapper] {e}")
-        return f"[OpenAI API Error] {e}"
+    # ----------------- Public Wrapper -----------------
+    def generate_response(self, user_input: str, system_prompt: str, prefer_local=True, force_openai_json=False) -> str:
+        try:
+            final_prompt = self._apply_preferences(system_prompt, user_input)
+
+            if prefer_local and not force_openai_json:
+                logging.debug(f"[LOCAL-REST] Prompt: {final_prompt[:200]}...")
+                resp = self._call_ollama_rest(final_prompt)
+                if resp:
+                    return resp
+
+                logging.debug(f"[LOCAL-CLI fallback] Prompt: {final_prompt[:200]}...")
+                resp = self._call_ollama_cli(final_prompt)
+                if resp:
+                    return resp
+
+            logging.debug(f"[REMOTE] Prompt: {final_prompt[:200]}...")
+            return self._call_openai(final_prompt, force_json=force_openai_json)
+
+        except Exception as e:
+            logging.error(f"[NexaHybridAPI] generate_response error: {e}")
+            return f"My apologies, Sir, an error occurred while generating your response: {e}"
