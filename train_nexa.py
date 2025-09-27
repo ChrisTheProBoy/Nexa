@@ -27,7 +27,7 @@ bnb_config = BitsAndBytesConfig(
 # 📂 Paths
 log_dir = os.path.expanduser("~/Documents/Vs Code/nexa-assistant/logs")
 os.makedirs(log_dir, exist_ok=True)
-dataset_path = os.path.expanduser("~/Documents/Vs Code/nexa-assistant/nexa_dataset_5000.jsonl")
+dataset_path = os.path.expanduser("~/Documents/Vs Code/nexa-assistant/nexa_jarvis_persona_dataset.jsonl")
 output_dir = os.path.expanduser("~/Documents/Vs Code/nexa-assistant/nexa_finetuned")
 
 # 📝 Logging setup
