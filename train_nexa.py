@@ -7,14 +7,11 @@ from transformers import (
     Trainer,
     TrainingArguments,
     BitsAndBytesConfig,
+    DataCollatorForLanguageModeling,
 )
 from datasets import load_dataset
-from huggingface_hub import login
-
-
-# 🔑 Login to Hugging Face Hub
-login("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")  # replace with your real token
-
+# --- ADD THIS IMPORT ---
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
 # ⚙️ BitsAndBytes 4-bit quantization config (QLoRA ready)
 bnb_config = BitsAndBytesConfig(
@@ -24,19 +21,18 @@ bnb_config = BitsAndBytesConfig(
     bnb_4bit_compute_dtype=torch.float16,
 )
 
-# 📂 Paths
-log_dir = os.path.expanduser("~/Documents/Vs Code/nexa-assistant/logs")
+# 📂 Paths (Corrected for Colab)
+log_dir = "/content/drive/MyDrive/nexa-assistant/logs"
 os.makedirs(log_dir, exist_ok=True)
-dataset_path = os.path.expanduser("~/Documents/Vs Code/nexa-assistant/nexa_jarvis_persona_dataset.jsonl")
-output_dir = os.path.expanduser("~/Documents/Vs Code/nexa-assistant/nexa_finetuned")
+dataset_path = "/content/drive/MyDrive/nexa-assistant/nexa_jarvis_persona_dataset.jsonl"
+output_dir = "/content/drive/MyDrive/nexa-assistant/nexa_finetuned"
 
 # 📝 Logging setup
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[logging.FileHandler(os.path.join(log_dir, "finetune_mistral.log"), encoding="utf-8")],
 )
-
 
 def main():
     try:
@@ -45,50 +41,65 @@ def main():
         # 🔄 Load tokenizer & model
         logging.info(f"Loading model {model_name} with 4-bit quantization")
         tokenizer = AutoTokenizer.from_pretrained(model_name)
+        tokenizer.pad_token = tokenizer.eos_token
+
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
             quantization_config=bnb_config,
             device_map="auto",
         )
-
+        
+        # --- PREPARE MODEL FOR K-BIT TRAINING ---
+        model = prepare_model_for_kbit_training(model)
+        
+        # --- PEFT/LORA CONFIGURATION ---
+        model.config.pretraining_tp = 1
+        lora_config = LoraConfig(
+            r=8,
+            lora_alpha=16,
+            lora_dropout=0.05,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        model = get_peft_model(model, lora_config)
+        
         # 📊 Load dataset
         logging.info(f"Loading dataset from {dataset_path}")
-        if not os.path.exists(dataset_path):
-            raise FileNotFoundError(f"Dataset file {dataset_path} not found")
-
         dataset = load_dataset("json", data_files={"train": dataset_path})
 
         # 🔧 Preprocessing
         def preprocess_function(examples):
             texts = []
             for msgs in examples["messages"]:
-                if len(msgs) >= 3:  # Ensure structure matches
+                if len(msgs) >= 3:
                     text = (
-                        f"System: {msgs[0]['content']}\n\n"
-                        f"User: {msgs[1]['content']}\n"
-                        f"Assistant: {msgs[2]['content']}"
+                        f"<s>[INST] {msgs[0]['content']}\n{msgs[1]['content']} [/INST]"
+                        f"{msgs[2]['content']}</s>"
                     )
                     texts.append(text)
-            return tokenizer(texts, padding="max_length", truncation=True, max_length=512)
+            
+            tokenized_inputs = tokenizer(texts, padding="max_length", truncation=True, max_length=512)
+            tokenized_inputs["labels"] = tokenized_inputs["input_ids"][:]
+            return tokenized_inputs
 
         logging.info("Preprocessing dataset")
         dataset = dataset.map(preprocess_function, batched=True, remove_columns=["messages"])
 
-        # 🎯 Training arguments (small VRAM safe)
+        # 🎯 Training arguments
         training_args = TrainingArguments(
             output_dir=output_dir,
             num_train_epochs=3,
-            per_device_train_batch_size=1,  # Small batch size
-            gradient_accumulation_steps=8,  # Accumulate grads
+            per_device_train_batch_size=1,
+            gradient_accumulation_steps=8,
             learning_rate=2e-5,
             save_steps=200,
             save_total_limit=2,
             logging_dir=log_dir,
             logging_steps=50,
             fp16=True,
-            gradient_checkpointing=True,  # Saves memory
-            optim="paged_adamw_32bit",  # QLoRA optimizer
-            report_to="none",  # Disable WandB unless you want logging
+            gradient_checkpointing=True,
+            optim="paged_adamw_32bit",
+            report_to="none",
         )
 
         # 🚀 Trainer
@@ -96,6 +107,7 @@ def main():
             model=model,
             args=training_args,
             train_dataset=dataset["train"],
+            data_collator=DataCollatorForLanguageModeling(tokenizer, mlm=False),
         )
 
         logging.info("Starting fine-tuning")
@@ -111,7 +123,6 @@ def main():
     except Exception as e:
         logging.error(f"Error during fine-tuning: {e}")
         print(f"❌ An error occurred during fine-tuning: {e}")
-
 
 if __name__ == "__main__":
     main()
